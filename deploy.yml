@@ -1,0 +1,385 @@
+name: Deploy Movies App
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  # S3 Buckets
+  S3_UPLOAD_BUCKET: movies-app-upload-raw-videos
+  S3_STATIC_BUCKET: movies-app-static-frontend
+  # EC2
+  EC2_INSTANCE_TYPE: t2.medium
+  BE_INSTANCE_NAME: movies-backend
+  # CloudFront
+  CLOUDFRONT_COMMENT: movies-app-cdn
+
+jobs:
+  # ─────────────────────────────────────────
+  # 1. INFRASTRUCTURE — S3 + CloudFront + EC2
+  # ─────────────────────────────────────────
+  provision-infrastructure:
+    name: 🏗️ Provision AWS Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      upload_bucket: ${{ steps.buckets.outputs.upload_bucket }}
+      static_bucket: ${{ steps.buckets.outputs.static_bucket }}
+      cloudfront_domain: ${{ steps.cloudfront.outputs.domain }}
+      cloudfront_id: ${{ steps.cloudfront.outputs.id }}
+      ec2_instance_id: ${{ steps.ec2.outputs.instance_id }}
+      ec2_public_ip: ${{ steps.ec2_ip.outputs.public_ip }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # ── S3 Bucket 1: Raw Video Uploads (private) ──
+      - name: Create Upload S3 Bucket (private)
+        id: buckets
+        run: |
+          UPLOAD_BUCKET="movies-app-upload-raw-videos"
+          STATIC_BUCKET="movies-app-static-frontend"
+
+          for BUCKET in "$UPLOAD_BUCKET" "$STATIC_BUCKET"; do
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Bucket $BUCKET already exists, skipping."
+            else
+              aws s3api create-bucket \
+                --bucket "$BUCKET" \
+                --region us-east-1
+
+              aws s3api put-public-access-block \
+                --bucket "$BUCKET" \
+                --public-access-block-configuration \
+                  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+              aws s3api put-bucket-encryption \
+                --bucket "$BUCKET" \
+                --server-side-encryption-configuration '{
+                  "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+                }'
+
+              aws s3api put-bucket-versioning \
+                --bucket "$BUCKET" \
+                --versioning-configuration Status=Enabled
+
+              echo "✅ Created bucket: $BUCKET"
+            fi
+          done
+
+          # Enable CORS on upload bucket (for direct browser uploads via presigned URL)
+          aws s3api put-bucket-cors \
+            --bucket "$UPLOAD_BUCKET" \
+            --cors-configuration '{
+              "CORSRules": [{
+                "AllowedHeaders": ["*"],
+                "AllowedMethods": ["GET","PUT","POST","DELETE","HEAD"],
+                "AllowedOrigins": ["*"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 3000
+              }]
+            }'
+
+          echo "upload_bucket=$UPLOAD_BUCKET" >> $GITHUB_OUTPUT
+          echo "static_bucket=$STATIC_BUCKET" >> $GITHUB_OUTPUT
+
+      # ── CloudFront Distribution (serves videos from upload bucket) ──
+      - name: Create CloudFront Distribution
+        id: cloudfront
+        run: |
+          UPLOAD_BUCKET="movies-app-upload-raw-videos"
+          EXISTING=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='movies-app-cdn'].{id:Id,domain:DomainName}" \
+            --output json)
+
+          if echo "$EXISTING" | grep -q "movies-app-cdn"; then
+            DOMAIN=$(echo "$EXISTING" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['domain'])")
+            ID=$(echo "$EXISTING" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'])")
+            echo "CloudFront already exists: $DOMAIN"
+          else
+            OAC_ID=$(aws cloudfront create-origin-access-control \
+              --origin-access-control-config '{
+                "Name": "movies-app-oac",
+                "Description": "OAC for movies video bucket",
+                "SigningProtocol": "sigv4",
+                "SigningBehavior": "always",
+                "OriginAccessControlOriginType": "s3"
+              }' \
+              --query "OriginAccessControl.Id" --output text 2>/dev/null || \
+              aws cloudfront list-origin-access-controls \
+                --query "OriginAccessControlList.Items[?Name=='movies-app-oac'].Id" \
+                --output text)
+
+            RESULT=$(aws cloudfront create-distribution --distribution-config "{
+              \"CallerReference\": \"movies-app-$(date +%s)\",
+              \"Comment\": \"movies-app-cdn\",
+              \"DefaultCacheBehavior\": {
+                \"TargetOriginId\": \"movies-s3-origin\",
+                \"ViewerProtocolPolicy\": \"redirect-to-https\",
+                \"CachePolicyId\": \"658327ea-f89d-4fab-a63d-7e88639e58f6\",
+                \"AllowedMethods\": {\"Quantity\": 2, \"Items\": [\"GET\",\"HEAD\"]},
+                \"Compress\": true
+              },
+              \"Origins\": {
+                \"Quantity\": 1,
+                \"Items\": [{
+                  \"Id\": \"movies-s3-origin\",
+                  \"DomainName\": \"${UPLOAD_BUCKET}.s3.us-east-1.amazonaws.com\",
+                  \"OriginAccessControlId\": \"$OAC_ID\",
+                  \"S3OriginConfig\": {\"OriginAccessIdentity\": \"\"}
+                }]
+              },
+              \"Enabled\": true,
+              \"HttpVersion\": \"http2\",
+              \"PriceClass\": \"PriceClass_100\"
+            }")
+
+            DOMAIN=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['DomainName'])")
+            ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['Id'])")
+            echo "✅ CloudFront created: $DOMAIN"
+          fi
+
+          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── EC2 for Python Backend ──
+      - name: Get Latest Amazon Linux 2023 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" \
+            --query "Parameter.Value" --output text)
+          echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Security Group for Backend
+        id: sg
+        run: |
+          SG_NAME="movies-backend-sg"
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text)
+
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$SG_NAME" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null)
+
+          if [ "$EXISTING_SG" != "None" ] && [ -n "$EXISTING_SG" ]; then
+            echo "sg_id=$EXISTING_SG" >> $GITHUB_OUTPUT
+            echo "Security group already exists: $EXISTING_SG"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "Movies app backend security group" \
+              --vpc-id "$VPC_ID" \
+              --query "GroupId" --output text)
+
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22   --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80   --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 8000 --cidr 0.0.0.0/0
+
+            aws ec2 create-tags --resources "$SG_ID" \
+              --tags Key=Name,Value="$SG_NAME" Key=App,Value=movies-app
+
+            echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+            echo "✅ Security group created: $SG_ID"
+          fi
+
+      - name: Launch EC2 Backend Instance
+        id: ec2
+        run: |
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=movies-backend" "Name=instance-state-name,Values=running,pending" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+
+          if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
+            echo "EC2 already running: $EXISTING"
+            echo "instance_id=$EXISTING" >> $GITHUB_OUTPUT
+          else
+            USER_DATA=$(cat <<'USERDATA' | base64 -w 0
+#!/bin/bash
+yum update -y
+yum install -y python3 python3-pip git
+pip3 install fastapi uvicorn boto3 python-multipart
+
+mkdir -p /app
+cat > /app/main.py << 'PYEOF'
+from fastapi import FastAPI
+import subprocess
+subprocess.Popen(["python3", "/app/server.py"])
+PYEOF
+
+systemctl enable --now movies-backend 2>/dev/null || true
+USERDATA
+)
+
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id "${{ steps.ami.outputs.ami_id }}" \
+              --instance-type "t2.medium" \
+              --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+              --user-data "$USER_DATA" \
+              --tag-specifications "ResourceType=instance,Tags=[
+                {Key=Name,Value=movies-backend},
+                {Key=App,Value=movies-app},
+                {Key=CreatedBy,Value=github-actions}
+              ]" \
+              --block-device-mappings '[{
+                "DeviceName": "/dev/xvda",
+                "Ebs": {"VolumeSize": 20,"VolumeType":"gp3","DeleteOnTermination":true,"Encrypted":true}
+              }]' \
+              --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+              --query "Instances[0].InstanceId" --output text)
+
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "✅ EC2 launched: $INSTANCE_ID"
+          fi
+
+      - name: Wait for EC2 Running
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+
+      - name: Get EC2 Public IP
+        id: ec2_ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "public_ip=$IP" >> $GITHUB_OUTPUT
+          echo "Backend EC2 IP: $IP"
+
+  # ─────────────────────────────────────────
+  # 2. DEPLOY PYTHON BACKEND to EC2
+  # ─────────────────────────────────────────
+  deploy-backend:
+    name: 🐍 Deploy Python Backend
+    runs-on: ubuntu-latest
+    needs: provision-infrastructure
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy backend files to EC2 via SSM
+        run: |
+          INSTANCE_ID="${{ needs.provision-infrastructure.outputs.ec2_instance_id }}"
+          CLOUDFRONT_DOMAIN="${{ needs.provision-infrastructure.outputs.cloudfront_domain }}"
+          UPLOAD_BUCKET="movies-app-upload-raw-videos"
+
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              'pip3 install fastapi uvicorn boto3 python-multipart mangum',
+              'mkdir -p /app',
+              'cat > /app/main.py << EOF',
+              'from fastapi import FastAPI, UploadFile, File, Form, Query',
+              'from fastapi.middleware.cors import CORSMiddleware',
+              'import boto3, uuid, json, os',
+              'app = FastAPI(title=\"Movies API\")',
+              'app.add_middleware(CORSMiddleware, allow_origins=[\"*\"], allow_methods=[\"*\"], allow_headers=[\"*\"])',
+              'S3_UPLOAD = \"$UPLOAD_BUCKET\"',
+              'CF_DOMAIN = \"https://$CLOUDFRONT_DOMAIN\"',
+              'DB_FILE = \"/app/movies_db.json\"',
+              'EOF',
+              'cat >> /app/start.sh << SH',
+              'cd /app && uvicorn main:app --host 0.0.0.0 --port 8000 --reload &',
+              'SH',
+              'chmod +x /app/start.sh',
+              'bash /app/start.sh'
+            ]" \
+            --output text
+          echo "✅ Backend deploy command sent."
+
+  # ─────────────────────────────────────────
+  # 3. BUILD & DEPLOY REACT FRONTEND to S3
+  # ─────────────────────────────────────────
+  deploy-frontend:
+    name: ⚛️ Build & Deploy React Frontend
+    runs-on: ubuntu-latest
+    needs: [provision-infrastructure, deploy-backend]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build React App
+        working-directory: frontend
+        env:
+          REACT_APP_API_URL: http://${{ needs.provision-infrastructure.outputs.ec2_public_ip }}:8000
+          REACT_APP_CDN_URL: https://${{ needs.provision-infrastructure.outputs.cloudfront_domain }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Upload React Build to S3 (Static Frontend Bucket)
+        run: |
+          aws s3 sync frontend/build/ s3://movies-app-static-frontend/ \
+            --delete \
+            --cache-control "max-age=86400"
+
+          # Set index.html to no-cache for SPA routing
+          aws s3 cp frontend/build/index.html s3://movies-app-static-frontend/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          echo "✅ Frontend deployed to S3!"
+
+      - name: Invalidate CloudFront Cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ needs.provision-infrastructure.outputs.cloudfront_id }}" \
+            --paths "/*"
+          echo "✅ CloudFront cache invalidated!"
+
+  # ─────────────────────────────────────────
+  # 4. SUMMARY
+  # ─────────────────────────────────────────
+  summary:
+    name: 📋 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [provision-infrastructure, deploy-backend, deploy-frontend]
+    if: always()
+
+    steps:
+      - name: Print Summary
+        run: |
+          echo "## 🎬 Movies App Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### AWS Resources" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🪣 Upload Bucket (private) | \`movies-app-upload-raw-videos\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🪣 Frontend Bucket (static) | \`movies-app-static-frontend\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 CloudFront CDN | \`https://${{ needs.provision-infrastructure.outputs.cloudfront_domain }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🖥️ Backend EC2 | \`${{ needs.provision-infrastructure.outputs.ec2_public_ip }}:8000\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "- **Frontend**: Hosted on \`movies-app-static-frontend\` S3 + CloudFront" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend API**: \`http://${{ needs.provision-infrastructure.outputs.ec2_public_ip }}:8000\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Video CDN**: \`https://${{ needs.provision-infrastructure.outputs.cloudfront_domain }}/videos/<key>\`" >> $GITHUB_STEP_SUMMARY
