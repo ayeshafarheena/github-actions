@@ -1,7 +1,9 @@
 name: Create AWS EC2 & S3
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 env:
   AWS_REGION: us-east-1
