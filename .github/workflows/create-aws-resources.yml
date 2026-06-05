@@ -2,44 +2,13 @@ name: Create AWS EC2 & S3
 
 on:
   workflow_dispatch:
-    inputs:
-      instance_type:
-        description: 'EC2 Instance Type'
-        required: true
-        default: 't2.micro'
-        type: choice
-        options:
-          - t2.micro
-          - t2.small
-          - t2.medium
-          - t3.micro
-          - t3.small
-      s3_bucket_name:
-        description: 'S3 Bucket Name (must be globally unique)'
-        required: true
-        type: string
-      aws_region:
-        description: 'AWS Region'
-        required: true
-        default: 'us-east-1'
-        type: choice
-        options:
-          - us-east-1
-          - us-west-2
-          - ap-south-1
-          - eu-west-1
-      environment:
-        description: 'Environment tag'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - staging
-          - prod
 
 env:
-  AWS_REGION: ${{ github.event.inputs.aws_region }}
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t2.medium
+  S3_BUCKET_NAME: gitaction-s3-ec2-0875
+  INSTANCE_NAME: git
+  ENVIRONMENT: dev
 
 jobs:
   create-s3-bucket:
@@ -55,27 +24,19 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-east-1
 
       - name: Create S3 Bucket
         id: create_bucket
         run: |
-          BUCKET_NAME="${{ github.event.inputs.s3_bucket_name }}"
-          REGION="${{ env.AWS_REGION }}"
+          BUCKET_NAME="gitaction-s3-ec2-0875"
+          REGION="us-east-1"
 
           echo "Creating S3 bucket: $BUCKET_NAME in $REGION"
 
-          # us-east-1 does NOT use LocationConstraint
-          if [ "$REGION" == "us-east-1" ]; then
-            aws s3api create-bucket \
-              --bucket "$BUCKET_NAME" \
-              --region "$REGION"
-          else
-            aws s3api create-bucket \
-              --bucket "$BUCKET_NAME" \
-              --region "$REGION" \
-              --create-bucket-configuration LocationConstraint="$REGION"
-          fi
+          aws s3api create-bucket \
+            --bucket "$BUCKET_NAME" \
+            --region "$REGION"
 
           # Block all public access
           aws s3api put-public-access-block \
@@ -103,7 +64,7 @@ jobs:
           aws s3api put-bucket-tagging \
             --bucket "$BUCKET_NAME" \
             --tagging "TagSet=[
-              {Key=Environment,Value=${{ github.event.inputs.environment }}},
+              {Key=Environment,Value=dev},
               {Key=CreatedBy,Value=github-actions},
               {Key=Repository,Value=${{ github.repository }}}
             ]"
@@ -129,7 +90,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-east-1
 
       - name: Get Latest Amazon Linux 2023 AMI
         id: get_ami
@@ -144,9 +105,8 @@ jobs:
       - name: Create Security Group
         id: create_sg
         run: |
-          SG_NAME="gh-actions-sg-${{ github.run_id }}"
+          SG_NAME="git-sg-${{ github.run_id }}"
 
-          # Get default VPC ID
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=isDefault,Values=true" \
             --query "Vpcs[0].VpcId" \
@@ -154,7 +114,6 @@ jobs:
 
           echo "Using VPC: $VPC_ID"
 
-          # Create security group
           SG_ID=$(aws ec2 create-security-group \
             --group-name "$SG_NAME" \
             --description "Created by GitHub Actions run ${{ github.run_id }}" \
@@ -162,24 +121,21 @@ jobs:
             --query "GroupId" \
             --output text)
 
-          # Allow SSH (port 22) — restrict to your IP in production!
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 22 \
             --cidr 0.0.0.0/0
 
-          # Allow HTTP (port 80)
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 80 \
             --cidr 0.0.0.0/0
 
-          # Tag it
           aws ec2 create-tags \
             --resources "$SG_ID" \
-            --tags Key=Name,Value="$SG_NAME" Key=Environment,Value=${{ github.event.inputs.environment }} Key=CreatedBy,Value=github-actions
+            --tags Key=Name,Value="$SG_NAME" Key=Environment,Value=dev Key=CreatedBy,Value=github-actions
 
           echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
           echo "✅ Security Group '$SG_ID' created."
@@ -189,11 +145,11 @@ jobs:
         run: |
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "${{ steps.get_ami.outputs.ami_id }}" \
-            --instance-type "${{ github.event.inputs.instance_type }}" \
+            --instance-type "t2.medium" \
             --security-group-ids "${{ steps.create_sg.outputs.sg_id }}" \
             --tag-specifications "ResourceType=instance,Tags=[
-              {Key=Name,Value=gh-actions-ec2-${{ github.run_id }}},
-              {Key=Environment,Value=${{ github.event.inputs.environment }}},
+              {Key=Name,Value=git},
+              {Key=Environment,Value=dev},
               {Key=CreatedBy,Value=github-actions},
               {Key=Repository,Value=${{ github.repository }}}
             ]" \
@@ -243,10 +199,10 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Details |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **S3 Bucket** | \`${{ needs.create-s3-bucket.outputs.bucket_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **S3 Bucket** | \`gitaction-s3-ec2-0875\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **EC2 Instance Name** | \`git\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **EC2 Instance ID** | \`${{ needs.create-ec2-instance.outputs.instance_id }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **EC2 Public IP** | \`${{ needs.create-ec2-instance.outputs.public_ip }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Region** | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Environment** | \`${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> ⚠️ Remember to store your EC2 key pair and restrict SSH access to your IP in production!" >> $GITHUB_STEP_SUMMARY
+          echo "| **Instance Type** | \`t2.medium\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | \`us-east-1\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`dev\` |" >> $GITHUB_STEP_SUMMARY
